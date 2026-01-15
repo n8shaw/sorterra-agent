@@ -1,5 +1,11 @@
+langchain
 langchain-anthropic
 langchain-ollama
+langchain-community
 langgraph
 python-dotenv
-pathlib
+chromadb
+sentence-transformers
+langchain-huggingface
+pypdf
+docx2txt

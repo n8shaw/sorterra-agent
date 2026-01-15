@@ -4,6 +4,7 @@ from typing import Annotated, Literal, TypedDict
 from pathlib import Path
 from dotenv import load_dotenv
 
+# LangChain & LangGraph
 from langchain_anthropic import ChatAnthropic
 from langchain_ollama import ChatOllama
 from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
@@ -11,120 +12,171 @@ from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
 
+# Loaders & Vector Stack
+from langchain_community.document_loaders import TextLoader, PyPDFLoader, Docx2txtLoader
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import Chroma
+
 load_dotenv()
 
-# --- 1. DYNAMIC RECIPE CONFIGURATION ---
-# In the future, this dictionary could be fetched from a JSON file or DB
+# --- CONFIGURATION ---
+VECTOR_DB_PATH = "./sorterra_memory"
+TEST_FOLDER = "./test_folder"
+# Using a lightweight local embedding model
+EMBEDDING_MODEL = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
 DEFAULT_RECIPE = {
-    "name": "Standard Sorting",
+    "name": "Intelligent Project Sort",
     "rules": [
-        ".pdf and .docx files go to 'Documents'",
-        ".jpg and .png files go to 'Images'",
-        "Any file with 'invoice' in the name goes to 'Finance'"
+        "1. If a file is an invoice, move it to 'Finance/Invoices'.",
+        "2. For other documents, find the project name (e.g., 'Project Alpha', 'Project Beta').",
+        "3. Move those files to 'Projects/[Project Name]'.",
+        "4. If no project is found, move it to 'Unsorted'."
     ]
 }
 
-def get_sorting_instructions(recipe: dict) -> str:
-    """Formats the recipe dictionary into a system prompt string."""
-    rules_str = "\n".join([f"- {rule}" for rule in recipe["rules"]])
-    return (
-        f"You are the Sorterra Agent. Your job is to sort files based on the '{recipe['name']}' recipe:\n"
-        f"{rules_str}\n\n"
-        "Instructions:\n"
-        "1. First, list the files in the directory to see what needs sorting.\n"
-        "2. Analyze the filenames and extensions.\n"
-        "3. Move the files one by one to the appropriate folders according to the recipe rules.\n"
-        "4. If a file doesn't match any rule, leave it where it is."
-    )
+# --- 1. VECTOR MEMORY UTILS ---
 
-# --- 2. TOOLS (CLOUD-PORTABLE LOGIC) ---
+class SorterraMemory:
+    def __init__(self):
+        self.db = Chroma(persist_directory=VECTOR_DB_PATH, embedding_function=EMBEDDING_MODEL)
+
+    def get_similar_mapping(self, content: str):
+        """Finds where similar files were previously moved."""
+        try:
+            results = self.db.similarity_search_with_relevance_scores(content, k=2)
+            if not results or results[0][1] < 0.4: # Similarity threshold
+                return "No high-confidence matches in memory."
+            
+            hints = []
+            for doc, score in results:
+                category = doc.metadata.get("destination", "unknown")
+                hints.append(f"Previously sorted to '{category}' (Confidence: {score:.2f})")
+            return "\n".join(hints)
+        except Exception:
+            return "Memory is currently empty."
+
+    def learn_new_move(self, content: str, destination: str):
+        """Indexes a successfully moved file for future reference."""
+        self.db.add_texts(
+            texts=[content],
+            metadatas=[{"destination": destination}]
+        )
+        print(f"DEBUG: Sorterra learned that this content belongs in {destination}")
+
+memory = SorterraMemory()
+
+# --- 2. TOOLS ---
+
+@tool
+def read_file_content(file_path: str):
+    """Reads PDF, DOCX, or TXT content. Essential for identifying project context."""
+    path = Path(file_path)
+    if not path.exists(): return f"Error: {file_path} not found."
+    try:
+        if path.suffix == ".pdf": loader = PyPDFLoader(str(path))
+        elif path.suffix == ".docx": loader = Docx2txtLoader(str(path))
+        else: loader = TextLoader(str(path))
+        
+        docs = loader.load()
+        full_text = " ".join([d.page_content for d in docs])
+        return full_text[:2000] # Cap for context window
+    except Exception as e:
+        return f"Error reading {path.name}: {str(e)}"
+
+@tool
+def get_past_examples(file_path: str):
+    """Checks the vector database for where similar files were sorted in the past."""
+    content = read_file_content.invoke(file_path)
+    if "Error" in content: return content
+    return memory.get_similar_mapping(content)
+
 @tool
 def move_file(source_path: str, destination_folder: str):
-    """Moves a file to a specific destination folder. Use this for sorting."""
+    """Moves file and triggers the 'learning' process for the vector DB."""
     source = Path(source_path)
     dest_dir = Path(destination_folder)
-    
-    if not source.exists():
-        return f"Error: File {source_path} does not exist."
-    
     dest_dir.mkdir(parents=True, exist_ok=True)
+    
     try:
+        # Before moving, read content so we can 'learn' it
+        content = read_file_content.invoke(source_path)
+        
+        # Perform move
         shutil.move(str(source), str(dest_dir / source.name))
-        return f"Successfully moved {source.name} to {destination_folder}"
+        
+        # Update Vector Memory
+        if "Error" not in content:
+            memory.learn_new_move(content, destination_folder)
+            
+        return f"Successfully moved {source.name} to {destination_folder} and updated memory."
     except Exception as e:
-        return f"Failed to move file: {str(e)}"
+        return f"Failed to move: {str(e)}"
 
 @tool
 def list_local_files(directory: str):
-    """Lists all files in a directory to identify what needs sorting."""
+    """Lists files to be sorted."""
     path = Path(directory)
-    if not path.is_dir():
-        return f"Error: {directory} is not a valid directory."
-    
-    files = [f.name for f in path.iterdir() if f.is_file()]
-    return f"Files found in {directory}: {', '.join(files)}"
+    if not path.is_dir(): return f"Error: {directory} is not a directory."
+    return [str(f) for f in path.iterdir() if f.is_file()]
 
-tools = [move_file, list_local_files]
+tools = [move_file, list_local_files, read_file_content, get_past_examples]
 tool_node = ToolNode(tools)
 
-# --- 3. GRAPH STATE ---
-class AgentState(TypedDict):
-    messages: Annotated[list[BaseMessage], "The conversation history"]
-    # We can add 'recipe' to the state here if we want to pass it dynamically per-run
-    recipe: dict 
+# --- 3. GRAPH LOGIC ---
 
-# --- 4. MODEL SELECTION ---
+class AgentState(TypedDict):
+    messages: Annotated[list[BaseMessage], "Conversation history"]
+    recipe: dict
+
 def get_model(local=False):
     if local:
         return ChatOllama(model="deepseek-r1:8b", temperature=0).bind_tools(tools)
-    else:
-        return ChatAnthropic(model="claude-3-5-sonnet-20241022", temperature=0).bind_tools(tools)
+    return ChatAnthropic(model="claude-3-5-sonnet-20241022", temperature=0).bind_tools(tools)
 
-# --- 5. AGENT NODE ---
 def call_model(state: AgentState):
-    messages = state['messages']
-    # Fetch the recipe from state (or default if not provided)
     recipe = state.get("recipe", DEFAULT_RECIPE)
+    rules_str = "\n".join(recipe["rules"])
     
-    system_prompt = SystemMessage(content=get_sorting_instructions(recipe))
+    system_prompt = SystemMessage(content=(
+        f"You are the Sorterra Agent. Your goal: Sort files using '{recipe['name']}'.\n\n"
+        f"CORE RULES:\n{rules_str}\n\n"
+        "HYBRID STRATEGY:\n"
+        "1. List files in the target directory.\n"
+        "2. For EACH file, use 'get_past_examples' to see vector similarity hints.\n"
+        "3. Use 'read_file_content' to confirm against the Core Rules.\n"
+        "4. If Vector Hints and Core Rules align, move the file.\n"
+        "5. If rules are ambiguous (e.g. 'Project Alpha' isn't explicitly named), "
+        "trust the high-confidence vector matches."
+    ))
     
-    response = model.invoke([system_prompt] + messages)
+    response = model.invoke([system_prompt] + state['messages'])
     return {"messages": [response]}
 
-def should_continue(state: AgentState) -> Literal["tools", END]:
+def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
     last_message = state['messages'][-1]
-    return "tools" if last_message.tool_calls else END
+    return "tools" if last_message.tool_calls else "__end__"
 
-# --- 6. BUILD THE GRAPH ---
+# Compile Graph
 workflow = StateGraph(AgentState)
 workflow.add_node("agent", call_model)
 workflow.add_node("tools", tool_node)
-
 workflow.set_entry_point("agent")
 workflow.add_conditional_edges("agent", should_continue)
 workflow.add_edge("tools", "agent")
-
 app = workflow.compile()
 
-# --- 7. EXECUTION ---
 if __name__ == "__main__":
-    USE_LOCAL = False 
-    model = get_model(local=USE_LOCAL)
-
-    print(f"--- Sorterra Running ({'Local' if USE_LOCAL else 'Cloud'}) ---")
+    model = get_model(local=False) # Toggle to True for your Ollama setup
     
-    # You can now pass a CUSTOM recipe here if you want to override the default
     inputs = {
-        "messages": [HumanMessage(content="Sort the files in ./test_folder")],
-        "recipe": DEFAULT_RECIPE 
+        "messages": [HumanMessage(content=f"Sort the files in {TEST_FOLDER}")],
+        "recipe": DEFAULT_RECIPE
     }
     
     for output in app.stream(inputs, stream_mode="updates"):
         for node, values in output.items():
             if "messages" in values:
                 last_msg = values["messages"][-1]
-                # Log model's reasoning/action
-                if hasattr(last_msg, 'content') and last_msg.content:
+                if last_msg.content:
                     print(f"[{node}]: {last_msg.content}")
-                if last_msg.tool_calls:
-                    print(f"[{node}]: Calling tools: {[t['name'] for t in last_msg.tool_calls]}")
